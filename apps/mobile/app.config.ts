@@ -15,30 +15,38 @@ const VARIANT_CONFIG: Record<
     readonly appName: string;
     readonly scheme: string;
     readonly iosIcon: string;
+    readonly splashIcon: string;
     readonly iosBundleIdentifier: string;
     readonly androidPackage: string;
+    readonly relyingParty?: string;
   }
 > = {
   development: {
     appName: "T3 Code Dev",
     scheme: "t3code-dev",
     iosIcon: "./assets/icon-composer-dev.icon",
+    splashIcon: "./assets/splash-icon-dev.png",
     iosBundleIdentifier: "com.t3tools.t3code.dev",
     androidPackage: "com.t3tools.t3code.dev",
+    relyingParty: "clerk.t3.codes",
   },
   preview: {
     appName: "T3 Code Preview",
     scheme: "t3code-preview",
     iosIcon: "./assets/icon-composer-prod.icon",
+    splashIcon: "./assets/splash-icon-prod.png",
     iosBundleIdentifier: "com.t3tools.t3code.preview",
     androidPackage: "com.t3tools.t3code.preview",
+    relyingParty: "clerk.t3.codes",
   },
   production: {
     appName: "T3 Code",
     scheme: "t3code",
     iosIcon: "./assets/icon-composer-prod.icon",
+    splashIcon: "./assets/splash-icon-prod.png",
     iosBundleIdentifier: "com.t3tools.t3code",
     androidPackage: "com.t3tools.t3code",
+    relyingParty: "clerk.t3.codes",
   },
 };
 
@@ -62,7 +70,11 @@ const config: ExpoConfig = {
   scheme: variant.scheme,
   version: "0.1.0",
   runtimeVersion: {
-    policy: process.env.MOBILE_VERSION_POLICY ?? "appVersion",
+    // Fingerprint (not appVersion) so an OTA only reaches binaries whose native
+    // project — native deps, config plugins, AND patches/ — matches the update.
+    // With appVersion, every 0.1.0 build shares a runtime version, so a JS update
+    // could land on a binary missing the native changes it needs and crash.
+    policy: process.env.MOBILE_VERSION_POLICY ?? "fingerprint",
   },
   orientation: "portrait",
   icon: "./assets/icon.png",
@@ -77,6 +89,14 @@ const config: ExpoConfig = {
     icon: variant.iosIcon,
     supportsTablet: true,
     bundleIdentifier: variant.iosBundleIdentifier,
+    // Pin code signing to the T3 Tools team so non-interactive `expo run:ios`
+    // does not fall back to a personal team (which cannot sign app groups,
+    // Sign in with Apple, or push notification entitlements).
+    appleTeamId: "ARK85ZXQ4Z",
+    associatedDomains: [
+      `applinks:${variant.relyingParty}`,
+      `webcredentials:${variant.relyingParty}`,
+    ],
     infoPlist: {
       NSAppTransportSecurity: {
         NSAllowsArbitraryLoads: true,
@@ -101,7 +121,6 @@ const config: ExpoConfig = {
     favicon: "./assets/favicon.png",
   },
   plugins: [
-    "expo-router",
     "expo-font",
     "expo-secure-store",
     ["@clerk/expo", { theme: "./clerk-theme.json" }],
@@ -116,12 +135,12 @@ const config: ExpoConfig = {
     [
       "expo-splash-screen",
       {
-        image: "./assets/splash-icon.png",
+        image: variant.splashIcon,
         resizeMode: "contain",
         backgroundColor: "#ffffff",
         imageWidth: 220,
         dark: {
-          image: "./assets/splash-icon.png",
+          image: variant.splashIcon,
           backgroundColor: "#0a0a0a",
         },
       },
@@ -139,12 +158,22 @@ const config: ExpoConfig = {
         },
       },
     ],
+    "./plugins/withIosCocoaPodsUuidCache.cjs",
+    // Must be listed BEFORE expo-widgets: same-type mods run last-registered-
+    // first, so registering earlier makes this plugin's mods run AFTER
+    // expo-widgets' — its dangerous mod wipes ios/ExpoWidgetsTarget/ (which
+    // would delete the asset catalog) and its xcodeproj mod creates the widget
+    // target (which must exist before the compile phase can be attached).
+    "./plugins/withWidgetLogoAsset.cjs",
     [
       "expo-widgets",
       {
         bundleIdentifier: `${variant.iosBundleIdentifier}.widgets`,
         groupIdentifier: `group.${variant.iosBundleIdentifier}`,
         enablePushNotifications: true,
+        // Agent activity can update many times an hour; without the
+        // frequent-updates entitlement iOS throttles the update budget sooner.
+        frequentUpdates: true,
         widgets: [
           {
             name: "AgentActivity",
@@ -155,6 +184,7 @@ const config: ExpoConfig = {
         ],
       },
     ],
+    "./plugins/withIosSceneLifecycle.cjs",
     "./plugins/withAndroidCleartextTraffic.cjs",
   ],
   extra: {
