@@ -42,6 +42,9 @@ describe("ServerSettings.providerInstances (slice-2 invariant)", () => {
     // Legacy `providers` struct is still hydrated with its per-driver defaults
     // so existing call sites keep working through the migration.
     expect(decoded.providers.codex.enabled).toBe(true);
+    expect(decoded.providers.bob.enabled).toBe(true);
+    expect(decoded.providers.bob.binaryPath).toBe("bob");
+    expect(decoded.providers.bob.authMethod).toBe("default");
   });
 
   it("decodes a multi-instance map mixing first-party and fork drivers", () => {
@@ -142,6 +145,10 @@ describe("ServerSettingsPatch string normalization", () => {
           binaryPath: "  /opt/homebrew/bin/codex  ",
           homePath: "  ~/.codex  ",
         },
+        bob: {
+          binaryPath: "  /opt/homebrew/bin/bob  ",
+          apiKeyEnvironmentVariable: "  BOBSHELL_API_KEY  ",
+        },
       },
       providerInstances: {
         codex_personal: {
@@ -157,6 +164,8 @@ describe("ServerSettingsPatch string normalization", () => {
     expect(patch.observability?.otlpTracesUrl).toBe("http://localhost:4318/v1/traces");
     expect(patch.providers?.codex?.binaryPath).toBe("/opt/homebrew/bin/codex");
     expect(patch.providers?.codex?.homePath).toBe("~/.codex");
+    expect(patch.providers?.bob?.binaryPath).toBe("/opt/homebrew/bin/bob");
+    expect(patch.providers?.bob?.apiKeyEnvironmentVariable).toBe("BOBSHELL_API_KEY");
     expect(patch.providerInstances?.[ProviderInstanceId.make("codex_personal")]?.driver).toBe(
       "codex",
     );

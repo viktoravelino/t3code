@@ -305,6 +305,101 @@ export const GrokSettings = makeProviderSettingsSchema(
 );
 export type GrokSettings = typeof GrokSettings.Type;
 
+export const BobAuthMethod = Schema.Literals(["default", "api-key"]);
+export type BobAuthMethod = typeof BobAuthMethod.Type;
+
+export const BobSettings = makeProviderSettingsSchema(
+  {
+    enabled: Schema.Boolean.pipe(
+      Schema.withDecodingDefault(Effect.succeed(true)),
+      Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
+    ),
+    binaryPath: makeBinaryPathSetting("bob").pipe(
+      Schema.annotateKey({
+        title: "Binary path",
+        description: "Path to the BOB Shell binary.",
+        providerSettingsForm: { placeholder: "bob", clearWhenEmpty: "omit" },
+      }),
+    ),
+    authMethod: BobAuthMethod.pipe(
+      Schema.withDecodingDefault(Effect.succeed("default" as const)),
+      Schema.annotateKey({
+        title: "Auth method",
+        description: "Authentication mode passed to BOB Shell.",
+        providerSettingsForm: { placeholder: "default", clearWhenEmpty: "omit" },
+      }),
+    ),
+    apiKeyEnvironmentVariable: TrimmedString.pipe(
+      Schema.withDecodingDefault(Effect.succeed("BOBSHELL_API_KEY")),
+      Schema.annotateKey({
+        title: "API key environment variable",
+        description: "Environment variable name BOB reads when auth method is api-key.",
+        providerSettingsForm: { placeholder: "BOBSHELL_API_KEY", clearWhenEmpty: "omit" },
+      }),
+    ),
+    teamId: TrimmedString.pipe(
+      Schema.withDecodingDefault(Effect.succeed("")),
+      Schema.annotateKey({
+        title: "Team ID",
+        description: "Optional BOB team id for this instance.",
+        providerSettingsForm: { placeholder: "team-id", clearWhenEmpty: "omit" },
+      }),
+    ),
+    instanceId: TrimmedString.pipe(
+      Schema.withDecodingDefault(Effect.succeed("")),
+      Schema.annotateKey({
+        title: "BOB instance ID",
+        description: "Optional BOB instance id for this provider instance.",
+        providerSettingsForm: { placeholder: "instance-id", clearWhenEmpty: "omit" },
+      }),
+    ),
+    launchArgs: Schema.String.pipe(
+      Schema.withDecodingDefault(Effect.succeed("")),
+      Schema.annotateKey({
+        title: "Launch arguments",
+        description: "Additional CLI arguments passed on session start.",
+        providerSettingsForm: {
+          placeholder: "e.g. --allowed-tools read_file",
+          clearWhenEmpty: "omit",
+        },
+      }),
+    ),
+    acceptLicense: Schema.Boolean.pipe(
+      Schema.withDecodingDefault(Effect.succeed(false)),
+      Schema.annotateKey({
+        title: "Accept license",
+        description: "Pass --accept-license when starting BOB.",
+        providerSettingsForm: { control: "switch" },
+      }),
+    ),
+    trustWorkspace: Schema.Boolean.pipe(
+      Schema.withDecodingDefault(Effect.succeed(false)),
+      Schema.annotateKey({
+        title: "Trust workspace",
+        description: "Pass --trust when starting BOB.",
+        providerSettingsForm: { control: "switch" },
+      }),
+    ),
+    customModels: Schema.Array(Schema.String).pipe(
+      Schema.withDecodingDefault(Effect.succeed([])),
+      Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
+    ),
+  },
+  {
+    order: [
+      "binaryPath",
+      "authMethod",
+      "apiKeyEnvironmentVariable",
+      "teamId",
+      "instanceId",
+      "launchArgs",
+      "acceptLicense",
+      "trustWorkspace",
+    ],
+  },
+);
+export type BobSettings = typeof BobSettings.Type;
+
 export const OpenCodeSettings = makeProviderSettingsSchema(
   {
     enabled: Schema.Boolean.pipe(
@@ -398,6 +493,7 @@ export const ServerSettings = Schema.Struct({
     claudeAgent: ClaudeSettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
     cursor: CursorSettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
     grok: GrokSettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
+    bob: BobSettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
     opencode: OpenCodeSettings.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
   }).pipe(Schema.withDecodingDefault(Effect.succeed({}))),
   // New driver-agnostic instance map. Keyed by `ProviderInstanceId`; values
@@ -493,6 +589,19 @@ const GrokSettingsPatch = Schema.Struct({
   customModels: Schema.optionalKey(Schema.Array(Schema.String)),
 });
 
+const BobSettingsPatch = Schema.Struct({
+  enabled: Schema.optionalKey(Schema.Boolean),
+  binaryPath: Schema.optionalKey(TrimmedString),
+  authMethod: Schema.optionalKey(BobAuthMethod),
+  apiKeyEnvironmentVariable: Schema.optionalKey(TrimmedString),
+  teamId: Schema.optionalKey(TrimmedString),
+  instanceId: Schema.optionalKey(TrimmedString),
+  launchArgs: Schema.optionalKey(TrimmedString),
+  acceptLicense: Schema.optionalKey(Schema.Boolean),
+  trustWorkspace: Schema.optionalKey(Schema.Boolean),
+  customModels: Schema.optionalKey(Schema.Array(Schema.String)),
+});
+
 const OpenCodeSettingsPatch = Schema.Struct({
   enabled: Schema.optionalKey(Schema.Boolean),
   binaryPath: Schema.optionalKey(TrimmedString),
@@ -522,6 +631,7 @@ export const ServerSettingsPatch = Schema.Struct({
       claudeAgent: Schema.optionalKey(ClaudeSettingsPatch),
       cursor: Schema.optionalKey(CursorSettingsPatch),
       grok: Schema.optionalKey(GrokSettingsPatch),
+      bob: Schema.optionalKey(BobSettingsPatch),
       opencode: Schema.optionalKey(OpenCodeSettingsPatch),
     }),
   ),
