@@ -14,6 +14,7 @@ import * as Stream from "effect/Stream";
 
 import {
   BobSettings,
+  EnvironmentId,
   ProviderDriverKind,
   ProviderInstanceId,
   type ProviderRuntimeEvent,
@@ -21,15 +22,31 @@ import {
 } from "@t3tools/contracts";
 
 import { ServerConfig } from "../../config.ts";
+import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import { makeBobAdapter } from "./BobAdapter.ts";
 
 const decodeBobSettings = Schema.decodeSync(BobSettings);
+const BobMcpServerConfig = Schema.Struct({
+  httpUrl: Schema.String,
+  headers: Schema.Struct({
+    Authorization: Schema.String,
+  }),
+  alwaysAllow: Schema.Array(Schema.String),
+});
+const BobMcpConfig = Schema.Struct({
+  mcpServers: Schema.Record(Schema.String, BobMcpServerConfig),
+});
+const decodeBobMcpConfigJson = Schema.decodeUnknownEffect(Schema.fromJsonString(BobMcpConfig));
 
 const bobAdapterTestLayer = ServerConfig.layerTest(process.cwd(), {
   prefix: "t3code-bob-adapter-test-",
 }).pipe(Layer.provideMerge(NodeServices.layer));
 
-async function makeMockBobWrapper(options?: { argvLogPath?: string }) {
+async function makeMockBobWrapper(options?: {
+  argvLogPath?: string;
+  cwdLogPath?: string;
+  mcpConfigLogPath?: string;
+}) {
   const dir = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "bob-mock-"));
   const wrapperPath = NodePath.join(dir, "fake-bob.sh");
   const argvLog = options?.argvLogPath
@@ -37,8 +54,18 @@ async function makeMockBobWrapper(options?: { argvLogPath?: string }) {
 printf '\\n' >> ${JSON.stringify(options.argvLogPath)}
 `
     : "";
+  const cwdLog = options?.cwdLogPath
+    ? `pwd > ${JSON.stringify(options.cwdLogPath)}
+`
+    : "";
+  const mcpConfigLog = options?.mcpConfigLogPath
+    ? `if [ -f .bob/mcp.json ]; then cat .bob/mcp.json > ${JSON.stringify(options.mcpConfigLogPath)}; fi
+`
+    : "";
   const script = `#!/bin/sh
 ${argvLog}
+${cwdLog}
+${mcpConfigLog}
 cat <<'BOB_NDJSON'
 {"type":"init","timestamp":"2026-06-23T18:56:30.478Z","session_id":"mock-bob-session","model":"premium"}
 {"type":"message","timestamp":"2026-06-23T18:56:31.000Z","role":"assistant","content":"The --prompt (-p) flag has been deprecated and will be removed.","delta":true}
@@ -186,6 +213,87 @@ it.layer(bobAdapterTestLayer)("BobAdapterLive", (it) => {
       ]);
 
       yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("writes a per-thread BOB MCP workspace for T3 native tools", () =>
+    Effect.gen(function* () {
+      const tempDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "bob-mcp-argv-")),
+      );
+      const argvLogPath = NodePath.join(tempDir, "argv.log");
+      const cwdLogPath = NodePath.join(tempDir, "cwd.log");
+      const mcpConfigLogPath = NodePath.join(tempDir, "mcp.json");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockBobWrapper({ argvLogPath, cwdLogPath, mcpConfigLogPath }),
+      );
+      const adapter = yield* makeBobAdapter(decodeBobSettings({ binaryPath: wrapperPath })).pipe(
+        Effect.orDie,
+      );
+      const threadId = ThreadId.make("bob-mcp-thread");
+      const cwd = NodePath.join(tempDir, "repo");
+      yield* Effect.promise(() => NodeFSP.mkdir(cwd, { recursive: true }));
+      yield* Effect.promise(() =>
+        NodeFSP.writeFile(
+          NodePath.join(cwd, "AGENTS.md"),
+          "## Available Skills\n\n- **caveman** - terse mode.\n",
+          "utf8",
+        ),
+      );
+      McpProviderSession.setMcpProviderSession({
+        environmentId: EnvironmentId.make("env-bob-mcp"),
+        threadId,
+        providerSessionId: "provider-session-bob-mcp",
+        providerInstanceId: ProviderInstanceId.make("bob"),
+        endpoint: "http://127.0.0.1:12345/mcp",
+        authorizationHeader: "Bearer test-token",
+      });
+      const turnCompleted = yield* Deferred.make<void>();
+      const eventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        event.type === "turn.completed" ? Deferred.succeed(turnCompleted, undefined) : Effect.void,
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("bob"),
+        cwd,
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({ threadId, input: "call preview_status", attachments: [] });
+      yield* Deferred.await(turnCompleted);
+      yield* Fiber.interrupt(eventsFiber);
+
+      const argv = yield* Effect.promise(() => readArgvLog(argvLogPath));
+      assert.includeMembers(argv[0] ?? [], ["--allowed-mcp-server-names", "t3-code"]);
+      assert.notInclude(argv[0] ?? [], "--include-directories");
+      const loggedCwd = (yield* Effect.promise(() => NodeFSP.readFile(cwdLogPath, "utf8"))).trim();
+      assert.equal(
+        yield* Effect.promise(() => NodeFSP.realpath(loggedCwd)),
+        yield* Effect.promise(() => NodeFSP.realpath(cwd)),
+      );
+
+      const mcpConfig = yield* decodeBobMcpConfigJson(
+        yield* Effect.promise(() => NodeFSP.readFile(mcpConfigLogPath, "utf8")),
+      );
+      assert.equal(mcpConfig.mcpServers?.["t3-code"]?.httpUrl, "http://127.0.0.1:12345/mcp");
+      assert.equal(mcpConfig.mcpServers?.["t3-code"]?.headers?.Authorization, "Bearer test-token");
+      assert.include(mcpConfig.mcpServers?.["t3-code"]?.alwaysAllow ?? [], "preview_status");
+      const instructions = yield* Effect.promise(() =>
+        NodeFSP.readFile(NodePath.join(cwd, "AGENTS.md"), "utf8"),
+      );
+      assert.include(instructions, "Available Skills");
+      assert.include(instructions, "caveman");
+      assert.isFalse(
+        yield* Effect.promise(() =>
+          NodeFSP.access(NodePath.join(cwd, ".bob", "mcp.json")).then(
+            () => true,
+            () => false,
+          ),
+        ),
+      );
+
+      yield* adapter.stopSession(threadId);
+      McpProviderSession.clearMcpProviderSession(threadId);
     }),
   );
 });

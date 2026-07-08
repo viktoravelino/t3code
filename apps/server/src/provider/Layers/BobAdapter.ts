@@ -13,21 +13,25 @@ import {
   TurnId,
 } from "@t3tools/contracts";
 import { parseCliArgs } from "@t3tools/shared/cliArgs";
+import { fromJsonStringPretty } from "@t3tools/shared/schemaJson";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
+import * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
+import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
 import { ServerConfig } from "../../config.ts";
+import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import {
-  ProviderAdapterProcessError,
   ProviderAdapterRequestError,
   ProviderAdapterSessionClosedError,
   ProviderAdapterSessionNotFoundError,
@@ -47,6 +51,34 @@ import { parseBobStreamLine } from "../bob/BobStreamParser.ts";
 
 const PROVIDER = ProviderDriverKind.make("bob");
 const BOB_RESUME_VERSION = 1 as const;
+const T3_MCP_SERVER_NAME = "t3-code";
+const T3_MCP_ALWAYS_ALLOW_TOOLS = [
+  "preview_status",
+  "preview_open",
+  "preview_navigate",
+  "preview_resize",
+  "preview_snapshot",
+  "preview_click",
+  "preview_type",
+  "preview_press",
+  "preview_scroll",
+  "preview_evaluate",
+  "preview_wait_for",
+  "preview_recording_start",
+  "preview_recording_stop",
+] as const;
+
+const T3_CODE_BROWSER_TOOL_INSTRUCTIONS = `# T3 Code collaborative browser
+
+You are running inside T3 Code. The \`t3-code\` MCP server is the product-native collaborative browser shared with the user. When it exposes \`preview_*\` tools, prefer those tools for browser navigation, inspection, interaction, screenshots, and recordings.
+
+For browser work, first call \`preview_status\`. If no automation-capable preview is attached, call \`preview_open\` before concluding that the browser is unavailable. Then use \`preview_navigate\`, \`preview_snapshot\`, and the focused interaction tools. Prefer snapshot-provided locators over coordinates.
+
+Do not switch to global browser tools, Chrome, Node REPL browser automation, standalone Playwright, or agent-browser merely because the preview is initially closed or a first call fails. Use an alternative browser system only when the T3 preview tools are absent, the user explicitly requests another browser, or \`preview_open\` returns an explicit unsupported/unavailable error. A failed T3 preview tool call should be inspected and retried with corrected arguments when the error is actionable.
+`;
+
+const decodeUnknownJsonString = Schema.decodeUnknownEffect(Schema.UnknownFromJsonString);
+const encodeUnknownJsonString = Schema.encodeEffect(fromJsonStringPretty(Schema.Unknown));
 
 export interface BobAdapterLiveOptions {
   readonly instanceId?: ProviderInstanceId;
@@ -135,6 +167,47 @@ function titleForToolUse(event: BobToolUseEvent): string {
   return event.tool_name;
 }
 
+function isUnknownRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function t3McpServerConfig(input: {
+  readonly endpoint: string;
+  readonly authorizationHeader: string;
+}) {
+  return {
+    httpUrl: input.endpoint,
+    headers: {
+      Authorization: input.authorizationHeader,
+    },
+    alwaysAllow: [...T3_MCP_ALWAYS_ALLOW_TOOLS],
+    disabled: false,
+  };
+}
+
+function mergeBobMcpConfig(
+  existing: unknown,
+  input: {
+    readonly endpoint: string;
+    readonly authorizationHeader: string;
+  },
+): unknown {
+  const root = isUnknownRecord(existing) ? { ...existing } : {};
+  const existingServers = root.mcpServers;
+  const mcpServers = isUnknownRecord(existingServers) ? { ...existingServers } : {};
+  mcpServers[T3_MCP_SERVER_NAME] = t3McpServerConfig(input);
+  return {
+    ...root,
+    mcpServers,
+  };
+}
+
+function promptWithT3McpInstructions(prompt: string): string {
+  return `${T3_CODE_BROWSER_TOOL_INSTRUCTIONS}
+
+${prompt}`;
+}
+
 function buildBobArgs(input: {
   readonly settings: BobSettings;
   readonly prompt: string;
@@ -143,6 +216,8 @@ function buildBobArgs(input: {
   readonly runtimeMode: ProviderSession["runtimeMode"];
   readonly sandboxMode?: string | undefined;
   readonly resumeSessionId?: string | undefined;
+  readonly includeDirectories?: ReadonlyArray<string> | undefined;
+  readonly t3McpEnabled?: boolean | undefined;
 }): ReadonlyArray<string> {
   const args: string[] = ["--output-format", "stream-json"];
   args.push("--chat-mode", input.interactionMode === "plan" ? "plan" : "code");
@@ -153,6 +228,10 @@ function buildBobArgs(input: {
   if (input.settings.teamId.trim()) args.push("--team-id", input.settings.teamId.trim());
   if (input.settings.instanceId.trim())
     args.push("--instance-id", input.settings.instanceId.trim());
+  for (const directory of input.includeDirectories ?? []) {
+    if (directory.trim().length > 0) args.push("--include-directories", directory);
+  }
+  if (input.t3McpEnabled) args.push("--allowed-mcp-server-names", T3_MCP_SERVER_NAME);
   if (input.sandboxMode && input.sandboxMode !== "danger-full-access") args.push("--sandbox");
   switch (input.runtimeMode) {
     case "full-access":
@@ -188,6 +267,8 @@ export function makeBobAdapter(bobSettings: BobSettings, options?: BobAdapterLiv
     const environment = options?.environment ?? process.env;
     const serverConfig = yield* ServerConfig;
     const crypto = yield* Crypto.Crypto;
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const runtimeEvents = yield* PubSub.unbounded<ProviderRuntimeEvent>();
     const sessions = new Map<ThreadId, BobSessionContext>();
@@ -256,6 +337,41 @@ export function makeBobAdapter(bobSettings: BobSettings, options?: BobAdapterLiv
         }
         return context;
       });
+
+    const prepareBobProjectMcpConfig = Effect.fn("prepareBobProjectMcpConfig")(function* (
+      context: BobSessionContext,
+    ) {
+      const mcpSession = McpProviderSession.readMcpProviderSession(context.session.threadId);
+      if (!mcpSession) {
+        return undefined;
+      }
+      const cwd = context.session.cwd ?? serverConfig.cwd;
+      const bobDir = path.join(cwd, ".bob");
+      const mcpConfigPath = path.join(bobDir, "mcp.json");
+      const previousContent = (yield* fs
+        .exists(mcpConfigPath)
+        .pipe(Effect.orElseSucceed(() => false)))
+        ? yield* fs.readFileString(mcpConfigPath)
+        : undefined;
+      const existingConfig = previousContent
+        ? yield* decodeUnknownJsonString(previousContent).pipe(Effect.orElseSucceed(() => ({})))
+        : {};
+      const mcpConfig = yield* encodeUnknownJsonString(
+        mergeBobMcpConfig(existingConfig, {
+          endpoint: mcpSession.endpoint,
+          authorizationHeader: mcpSession.authorizationHeader,
+        }),
+      );
+      yield* fs.makeDirectory(bobDir, { recursive: true });
+      yield* fs.writeFileString(mcpConfigPath, `${mcpConfig}\n`);
+      return {
+        cwd,
+        restore:
+          previousContent === undefined
+            ? fs.remove(mcpConfigPath, { force: true })
+            : fs.writeFileString(mcpConfigPath, previousContent),
+      } as const;
+    });
 
     const appendTurnItem = (context: BobSessionContext, turnId: TurnId, item: unknown) => {
       let turn = context.turns.find((candidate) => candidate.id === turnId);
@@ -397,99 +513,103 @@ export function makeBobAdapter(bobSettings: BobSettings, options?: BobAdapterLiv
       const resume =
         parseBobResume(context.session.resumeCursor) ??
         (context.bobSessionId ? { sessionId: context.bobSessionId } : undefined);
-      const args = buildBobArgs({
-        settings: bobSettings,
-        prompt: input.prompt,
-        model: input.model,
-        interactionMode: input.interactionMode,
-        runtimeMode: context.session.runtimeMode,
-        sandboxMode: input.sandboxMode,
-        resumeSessionId: resume?.sessionId,
-      });
-      const spawnCommand = yield* resolveSpawnCommand(bobSettings.binaryPath || "bob", args, {
-        env: environment,
-      });
-      const child = yield* spawner.spawn(
-        ChildProcess.make(spawnCommand.command, spawnCommand.args, {
-          cwd: context.session.cwd ?? serverConfig.cwd,
+      const mcpProject = yield* prepareBobProjectMcpConfig(context);
+      yield* Effect.gen(function* () {
+        const args = buildBobArgs({
+          settings: bobSettings,
+          prompt: mcpProject ? promptWithT3McpInstructions(input.prompt) : input.prompt,
+          model: input.model,
+          interactionMode: input.interactionMode,
+          runtimeMode: context.session.runtimeMode,
+          sandboxMode: input.sandboxMode,
+          resumeSessionId: resume?.sessionId,
+          ...(mcpProject ? { t3McpEnabled: true } : {}),
+        });
+        const spawnCommand = yield* resolveSpawnCommand(bobSettings.binaryPath || "bob", args, {
           env: environment,
-          shell: spawnCommand.shell,
-        }),
-      );
-      const stderrRef = yield* Ref.make("");
-      const stdoutFiber = yield* child.stdout.pipe(
-        Stream.decodeText(),
-        Stream.splitLines,
-        Stream.runForEach((line) => {
-          const parsed = parseBobStreamLine(line);
-          if (parsed === null) return Effect.void;
-          if (parsed.type === "known") return handleBobEvent(context, turnId, parsed.event);
-          if (parsed.type === "warning") {
-            return buildEventBase({ threadId: context.session.threadId, turnId }).pipe(
+        });
+        const child = yield* spawner.spawn(
+          ChildProcess.make(spawnCommand.command, spawnCommand.args, {
+            cwd: mcpProject?.cwd ?? context.session.cwd ?? serverConfig.cwd,
+            env: environment,
+            shell: spawnCommand.shell,
+          }),
+        );
+        const stderrRef = yield* Ref.make("");
+        const stdoutFiber = yield* child.stdout.pipe(
+          Stream.decodeText(),
+          Stream.splitLines,
+          Stream.runForEach((line) => {
+            const parsed = parseBobStreamLine(line);
+            if (parsed === null) return Effect.void;
+            if (parsed.type === "known") return handleBobEvent(context, turnId, parsed.event);
+            if (parsed.type === "warning") {
+              return buildEventBase({ threadId: context.session.threadId, turnId }).pipe(
+                Effect.flatMap((base) =>
+                  emit({
+                    ...base,
+                    type: "runtime.warning",
+                    payload: {
+                      message: "BOB emitted a non-JSON stream line.",
+                      detail: parsed,
+                    },
+                  }),
+                ),
+              );
+            }
+            return buildEventBase({
+              threadId: context.session.threadId,
+              turnId,
+              raw: parsed.payload,
+            }).pipe(
               Effect.flatMap((base) =>
                 emit({
                   ...base,
                   type: "runtime.warning",
                   payload: {
-                    message: "BOB emitted a non-JSON stream line.",
-                    detail: parsed,
+                    message: `BOB emitted unknown stream event '${parsed.eventType}'.`,
+                    detail: parsed.payload,
                   },
                 }),
               ),
             );
-          }
-          return buildEventBase({
-            threadId: context.session.threadId,
-            turnId,
-            raw: parsed.payload,
-          }).pipe(
-            Effect.flatMap((base) =>
-              emit({
-                ...base,
-                type: "runtime.warning",
-                payload: {
-                  message: `BOB emitted unknown stream event '${parsed.eventType}'.`,
-                  detail: parsed.payload,
-                },
-              }),
-            ),
-          );
-        }),
-        Effect.forkChild,
-      );
-      const stderrFiber = yield* child.stderr.pipe(
-        Stream.decodeText(),
-        Stream.runForEach((chunk) => Ref.update(stderrRef, (current) => current + chunk)),
-        Effect.forkChild,
-      );
-      const exitCode = yield* child.exitCode;
-      yield* Fiber.join(stdoutFiber).pipe(Effect.ignore);
-      yield* Fiber.join(stderrFiber).pipe(Effect.ignore);
-      if (Number(exitCode) !== 0) {
-        const stderr = (yield* Ref.get(stderrRef)).trim();
-        yield* emit({
-          ...(yield* buildEventBase({ threadId: context.session.threadId, turnId })),
-          type: "runtime.error",
-          payload: {
-            message: stderr || `BOB exited with code ${Number(exitCode)}.`,
-            class: "provider_error",
-          },
-        });
-        yield* emit({
-          ...(yield* buildEventBase({ threadId: context.session.threadId, turnId })),
-          type: "turn.completed",
-          payload: {
-            state: "failed",
-            errorMessage: stderr || `BOB exited with code ${Number(exitCode)}.`,
-          },
-        });
-        yield* updateSession(context, {
-          status: "error",
-          lastError: stderr || `BOB exited with code ${Number(exitCode)}.`,
-          activeTurnId: undefined,
-        });
-        context.activeTurnId = undefined;
-      }
+          }),
+          Effect.forkChild,
+        );
+        const stderrFiber = yield* child.stderr.pipe(
+          Stream.decodeText(),
+          Stream.runForEach((chunk) => Ref.update(stderrRef, (current) => current + chunk)),
+          Effect.forkChild,
+        );
+        const exitCode = yield* child.exitCode;
+        yield* Fiber.join(stdoutFiber).pipe(Effect.ignore);
+        yield* Fiber.join(stderrFiber).pipe(Effect.ignore);
+        if (Number(exitCode) !== 0) {
+          const stderr = (yield* Ref.get(stderrRef)).trim();
+          yield* emit({
+            ...(yield* buildEventBase({ threadId: context.session.threadId, turnId })),
+            type: "runtime.error",
+            payload: {
+              message: stderr || `BOB exited with code ${Number(exitCode)}.`,
+              class: "provider_error",
+            },
+          });
+          yield* emit({
+            ...(yield* buildEventBase({ threadId: context.session.threadId, turnId })),
+            type: "turn.completed",
+            payload: {
+              state: "failed",
+              errorMessage: stderr || `BOB exited with code ${Number(exitCode)}.`,
+            },
+          });
+          yield* updateSession(context, {
+            status: "error",
+            lastError: stderr || `BOB exited with code ${Number(exitCode)}.`,
+            activeTurnId: undefined,
+          });
+          context.activeTurnId = undefined;
+        }
+      }).pipe(Effect.ensuring(mcpProject?.restore.pipe(Effect.ignore) ?? Effect.void));
     });
 
     const runBobTurnSafely = (
